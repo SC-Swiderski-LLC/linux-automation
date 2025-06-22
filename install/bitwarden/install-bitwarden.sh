@@ -451,7 +451,7 @@ main() {
     
     # Check if there's a partial installation
     check_installation_status
-    local status=$?
+    status=$?
     
     if [[ $status -eq 0 ]]; then
         info "Bitwarden is already installed and running!"
