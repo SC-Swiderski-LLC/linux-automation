@@ -184,6 +184,12 @@ collect_installation_info() {
 install_bitwarden() {
     log "Installing Bitwarden..."
     
+    # Install expect if not present (needs to be done with sudo privileges)
+    if ! command -v expect &> /dev/null; then
+        log "Installing expect package..."
+        sudo apt install -y expect
+    fi
+    
     # Create installation script for bitwarden user
     cat > /tmp/bitwarden_install.sh << EOF
 #!/bin/bash
@@ -234,11 +240,6 @@ expect eof
 EOL
 
 chmod +x install_expect.sh
-
-# Install expect if not present
-if ! command -v expect &> /dev/null; then
-    sudo apt install -y expect
-fi
 
 # Run the installation
 ./install_expect.sh
@@ -344,11 +345,143 @@ verify_installation() {
     echo
 }
 
+# Check installation status and provide recovery options
+check_installation_status() {
+    log "Checking current installation status..."
+    
+    # Check if bitwarden user exists
+    if id "bitwarden" &>/dev/null; then
+        info "✓ Bitwarden user exists"
+    else
+        info "✗ Bitwarden user not found"
+    fi
+    
+    # Check if bitwarden directory exists
+    if [[ -d "/opt/bitwarden" ]]; then
+        info "✓ Bitwarden directory exists"
+        
+        # Check if bitwarden.sh script exists
+        if [[ -f "/opt/bitwarden/bitwarden.sh" ]]; then
+            info "✓ Bitwarden installation script found"
+            
+            # Check if bwdata directory exists (indicates successful installation)
+            if [[ -d "/opt/bitwarden/bwdata" ]]; then
+                info "✓ Bitwarden data directory exists - installation appears complete"
+                
+                # Check if containers are running
+                if sudo docker ps | grep -q bitwarden; then
+                    info "✓ Bitwarden containers are running"
+                    info "Bitwarden appears to be fully installed and running"
+                    return 0
+                else
+                    warning "⚠ Bitwarden containers not running"
+                    info "You can try starting Bitwarden with: sudo -u bitwarden /opt/bitwarden/bitwarden.sh start"
+                    return 1
+                fi
+            else
+                warning "⚠ Bitwarden data directory not found - installation incomplete"
+                return 2
+            fi
+        else
+            warning "⚠ Bitwarden installation script not found"
+            return 3
+        fi
+    else
+        info "✗ Bitwarden directory not found"
+        return 4
+    fi
+}
+
+# Recovery function for partial installations
+recover_installation() {
+    log "Attempting to recover from partial installation..."
+    
+    local status_code=$1
+    
+    case $status_code in
+        1)  # Containers not running
+            log "Attempting to start Bitwarden..."
+            sudo -u bitwarden bash -c "cd /opt/bitwarden && ./bitwarden.sh start"
+            ;;
+        2)  # Installation incomplete
+            log "Resuming Bitwarden installation..."
+            collect_installation_info
+            install_bitwarden
+            configure_environment
+            start_bitwarden
+            verify_installation
+            ;;
+        3|4)  # Missing files/directories
+            warning "Installation appears to be corrupted. Recommend clean reinstall."
+            read -p "Do you want to clean up and start fresh? (y/n): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                cleanup_installation
+                main
+            fi
+            ;;
+    esac
+}
+
+# Cleanup function
+cleanup_installation() {
+    log "Cleaning up partial installation..."
+    
+    # Stop any running containers
+    if sudo docker ps | grep -q bitwarden; then
+        log "Stopping Bitwarden containers..."
+        sudo -u bitwarden bash -c "cd /opt/bitwarden && ./bitwarden.sh stop" 2>/dev/null || true
+    fi
+    
+    # Remove bitwarden directory
+    if [[ -d "/opt/bitwarden" ]]; then
+        log "Removing Bitwarden directory..."
+        sudo rm -rf /opt/bitwarden
+    fi
+    
+    # Note: We keep the bitwarden user for security reasons
+    log "Cleanup completed. Bitwarden user preserved for security."
+}
+
 # Main installation function
 main() {
     log "Starting Bitwarden installation on Ubuntu 24.02..."
     
     check_root
+    
+    # Check if there's a partial installation
+    check_installation_status
+    local status=$?
+    
+    if [[ $status -eq 0 ]]; then
+        info "Bitwarden is already installed and running!"
+        info "Access it at: https://$(sudo -u bitwarden cat /opt/bitwarden/bwdata/config.yml | grep url: | cut -d' ' -f2 2>/dev/null || echo 'your-domain')"
+        exit 0
+    elif [[ $status -eq 1 ]]; then
+        read -p "Bitwarden is installed but not running. Try to start it? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            recover_installation $status
+            exit 0
+        fi
+    elif [[ $status -eq 2 || $status -eq 3 ]]; then
+        read -p "Partial installation detected. Continue with recovery? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            recover_installation $status
+            exit 0
+        else
+            read -p "Start clean installation instead? (y/n): " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                cleanup_installation
+            else
+                exit 1
+            fi
+        fi
+    fi
+    
+    # Proceed with fresh installation
     check_ubuntu_version
     update_system
     install_docker

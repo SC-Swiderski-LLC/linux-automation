@@ -56,7 +56,7 @@ Allow inbound traffic on:
 
 ```bash
 # Download from your GitHub repository
-wget https://raw.githubusercontent.com/SC-Swiderski-LLC/linux-automation/install/bitwarden/install-bitwarden.sh
+wget https://raw.githubusercontent.com/SC-Swiderski-LLC/linux-automation/main/install/bitwarden/install-bitwarden.sh
 
 # Make it executable
 chmod +x install-bitwarden.sh
