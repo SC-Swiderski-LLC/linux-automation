@@ -204,39 +204,135 @@ chmod 700 bitwarden.sh
 # Create expect script for automated installation
 cat > install_expect.sh << 'EOL'
 #!/usr/bin/expect -f
-set timeout -1
+set timeout 1800
+log_file install_log.txt
+
+proc check_progress {} {
+    puts "Installation in progress... (this may take several minutes)"
+}
 
 spawn ./bitwarden.sh install
+
+# Set a 30-minute timeout for the whole process
+set timeout 1800
 
 expect "Enter the domain name for your Bitwarden instance:"
 send "${DOMAIN_NAME}\r"
 
-expect "Do you want to use Let's Encrypt to generate a free SSL certificate? (y/n):"
+expect {
+    "Do you want to use Let's Encrypt to generate a free SSL certificate? (y/n):" {}
+    timeout {
+        puts "Timeout waiting for Let's Encrypt prompt"
+        exit 1
+    }
+}
 send "${USE_LETSENCRYPT}\r"
 
 if {"${USE_LETSENCRYPT}" == "y"} {
-    expect "Enter your email address (Let's Encrypt):"
+    expect {
+        "Enter your email address (Let's Encrypt):" {}
+        timeout {
+            puts "Timeout waiting for email prompt"
+            exit 1
+        }
+    }
     send "${LETSENCRYPT_EMAIL}\r"
 }
 
-expect "Enter your installation id:"
+expect {
+    "Enter your installation id:" {}
+    timeout {
+        puts "Timeout waiting for installation ID prompt"
+        exit 1
+    }
+}
 send "${INSTALL_ID}\r"
 
-expect "Enter your installation key:"
+expect {
+    "Enter your installation key:" {}
+    timeout {
+        puts "Timeout waiting for installation key prompt"
+        exit 1
+    }
+}
 send "${INSTALL_KEY}\r"
 
-expect "Enter your region (US/EU):"
+expect {
+    "Enter your region (US/EU):" {}
+    timeout {
+        puts "Timeout waiting for region prompt"
+        exit 1
+    }
+}
 send "${REGION}\r"
 
 if {"${USE_LETSENCRYPT}" != "y"} {
-    expect "Do you have a SSL certificate to use? (y/n):"
+    expect {
+        "Do you have a SSL certificate to use? (y/n):" {}
+        timeout {
+            puts "Timeout waiting for certificate prompt"
+            exit 1
+        }
+    }
     send "n\r"
     
-    expect "Do you want to generate a self-signed SSL certificate? (y/n):"
+    expect {
+        "Do you want to generate a self-signed SSL certificate? (y/n):" {}
+        timeout {
+            puts "Timeout waiting for self-signed certificate prompt"
+            exit 1
+        }
+    }
     send "y\r"
 }
 
-expect eof
+# Print a message every 60 seconds to show the script is still running
+set timeout 60
+while {1} {
+    expect {
+        "Starting Bitwarden" {
+            puts "Installation progress: Starting Bitwarden..."
+            exp_continue
+        }
+        "Installing Docker" {
+            puts "Installation progress: Installing Docker..."
+            exp_continue
+        }
+        "Restarting" {
+            puts "Installation progress: Restarting services..."
+            exp_continue
+        }
+        "Generating" {
+            puts "Installation progress: Generating certificates..."
+            exp_continue
+        }
+        "Downloading" {
+            puts "Installation progress: Downloading components..."
+            exp_continue
+        }
+        "Installing" {
+            puts "Installation progress: Installing components..."
+            exp_continue
+        }
+        "Configured" {
+            puts "Installation progress: Configuration complete..."
+            exp_continue
+        }
+        "Installation complete" {
+            puts "Installation complete!"
+            break
+        }
+        timeout {
+            check_progress
+            exp_continue
+        }
+        eof {
+            puts "Installation process ended"
+            break
+        }
+    }
+}
+EOL
 EOL
 
 chmod +x install_expect.sh
@@ -253,19 +349,38 @@ EOF
     
     # Export variables for the bitwarden user script
     export DOMAIN_NAME USE_LETSENCRYPT LETSENCRYPT_EMAIL INSTALL_ID INSTALL_KEY REGION
-    
-    # Switch to bitwarden user and run installation
+      # Switch to bitwarden user and run installation
+    log "Starting Bitwarden installation - this may take 10-20 minutes..."
+    log "The script will show progress updates every minute"
     sudo -u bitwarden bash /tmp/bitwarden_install.sh
+    
+    # Check if installation was successful
+    if [ ! -f "/opt/bitwarden/bwdata/docker/docker-compose.yml" ]; then
+        error "Installation failed - docker-compose.yml not found"
+        
+        # Check for installation log
+        if [ -f "/opt/bitwarden/install_log.txt" ]; then
+            log "Check installation log: /opt/bitwarden/install_log.txt"
+        fi
+        
+        exit 1
+    fi
     
     # Clean up
     rm /tmp/bitwarden_install.sh
     
-    log "Bitwarden installation completed"
+    log "Bitwarden installation completed successfully"
 }
 
 # Configure environment variables
 configure_environment() {
     log "Configuring environment variables..."
+    
+    # Check if environment file exists
+    if [ ! -f "/opt/bitwarden/bwdata/env/global.override.env" ]; then
+        error "Environment file not found! SMTP configuration will be skipped."
+        return 1
+    fi
     
     echo
     info "You need to configure SMTP settings for email functionality."
@@ -287,7 +402,10 @@ configure_environment() {
         # Update environment file as bitwarden user
         sudo -u bitwarden bash << EOF
 cd /opt/bitwarden
-cp bwdata/env/global.override.env bwdata/env/global.override.env.backup
+# Make a backup if the file exists
+if [ -f "bwdata/env/global.override.env" ]; then
+    cp bwdata/env/global.override.env bwdata/env/global.override.env.backup
+fi
 
 # Update SMTP settings
 sed -i "s|globalSettings__mail__smtp__host=.*|globalSettings__mail__smtp__host=${SMTP_HOST}|" bwdata/env/global.override.env
@@ -309,12 +427,24 @@ EOF
 start_bitwarden() {
     log "Starting Bitwarden..."
     
+    # Check if bitwarden.sh exists
+    if [ ! -f "/opt/bitwarden/bitwarden.sh" ]; then
+        error "bitwarden.sh not found! Cannot start Bitwarden."
+        return 1
+    fi
+    
     sudo -u bitwarden bash << 'EOF'
 cd /opt/bitwarden
 ./bitwarden.sh start
 EOF
     
-    log "Bitwarden started successfully"
+    # Verify that containers are running
+    if sudo docker ps | grep -q bitwarden; then
+        log "Bitwarden started successfully"
+    else
+        error "Bitwarden containers are not running. Installation may have failed."
+        return 1
+    fi
 }
 
 # Verify installation
