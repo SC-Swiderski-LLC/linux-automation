@@ -60,49 +60,71 @@ update_system() {
     sudo apt install -y curl wget apt-transport-https ca-certificates gnupg lsb-release
 }
 
-# Install Docker and Docker Compose
+# Install Docker and Docker Compose using Ubuntu packages
 install_docker() {
-    log "Installing Docker and Docker Compose..."
+    log "Installing Docker and Docker Compose from Ubuntu packages..."
     
     # Remove any old Docker installations
     sudo apt remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
     
-    # Install Docker using the official installation script
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sudo sh get-docker.sh
-    rm get-docker.sh
+    # Add Docker's official GPG key
+    log "Adding Docker repository GPG key..."
+    sudo apt-get update
+    sudo apt-get install -y ca-certificates curl gnupg
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+    
+    # Set up the Docker repository
+    log "Setting up Docker repository..."
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    # Install Docker Engine, CLI, containerd, and Docker Compose Plugin
+    log "Installing Docker Engine and Docker Compose Plugin..."
+    sudo apt-get update
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     
     # Verify Docker installation
     if ! sudo docker --version; then
         error "Docker installation failed"
         exit 1
     fi
-    log "Docker installed successfully"
+    log "Docker Engine installed successfully"
+      # Verify Docker Compose plugin installation
+    log "Verifying Docker Compose plugin..."
     
-    # Install Docker Compose plugin
-    log "Installing Docker Compose plugin..."
-    DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
-    mkdir -p $DOCKER_CONFIG/cli-plugins
-    
-    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    sudo curl -SL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-    sudo chmod +x /usr/local/bin/docker-compose
-    
-    # Also install as Docker plugin
-    sudo curl -SL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/lib/docker/cli-plugins/docker-compose
-    sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-    
-    # Verify Docker Compose installation
-    if ! docker-compose --version; then
-        warning "Docker Compose binary installation may have failed, trying alternative method"
-        sudo apt update && sudo apt install -y docker-compose
-    fi
-    
-    if ! sudo docker compose version; then
-        warning "Docker Compose plugin installation may have failed. Ensure Docker Compose is properly installed."
+    # Check for docker compose plugin first (should be installed with docker-compose-plugin)
+    if sudo docker compose version &>/dev/null; then
+        log "Docker Compose plugin is installed and working"
     else
-        log "Docker Compose plugin installed successfully"
+        warning "Docker Compose plugin might not be installed or not working properly"
+        
+        # Try to fix it by installing explicitly
+        log "Installing Docker Compose plugin explicitly..."
+        sudo apt update
+        sudo apt install -y docker-compose-plugin
+        
+        # Check again
+        if ! sudo docker compose version &>/dev/null; then
+            warning "Docker Compose plugin still not working, installing standalone docker-compose"
+            sudo apt install -y docker-compose
+            
+            # Create plugin symlink if standalone is working
+            if command -v docker-compose &>/dev/null; then
+                log "Setting up Docker Compose plugin symlink..."
+                sudo mkdir -p /usr/lib/docker/cli-plugins
+                sudo ln -sf "$(which docker-compose)" /usr/lib/docker/cli-plugins/docker-compose
+            else
+                error "Failed to install Docker Compose. Cannot continue with installation."
+                exit 1
+            fi
+        fi
     fi
+    
+    log "Docker Compose installation verified"
 }
 
 # Create Bitwarden user and directories
@@ -132,19 +154,54 @@ setup_bitwarden_user() {
     sudo chmod -R 700 /opt/bitwarden
     sudo chown -R bitwarden:bitwarden /opt/bitwarden
     
-    # Fix permissions for Docker socket
+    # Fix permissions for Docker socket - this is the most reliable method
+    # to ensure the bitwarden user has immediate access to Docker
     if [ -e /var/run/docker.sock ]; then
+        log "Setting Docker socket permissions for immediate access..."
         sudo chmod 666 /var/run/docker.sock
     fi
     
+    # Also set the correct group ownership for the Docker socket
+    if [ -e /var/run/docker.sock ]; then
+        sudo chgrp docker /var/run/docker.sock || true
+    fi
+    
     # Verify bitwarden user can run Docker
-    if ! sudo -u bitwarden docker info &>/dev/null; then
-        warning "Bitwarden user may not have proper Docker access"
-        warning "You may need to log out and log back in for group changes to take effect"
-        warning "You can try running: newgrp docker"
+    log "Verifying Docker access for bitwarden user..."
+    if sudo -u bitwarden docker info &>/dev/null; then
+        log "Bitwarden user has access to Docker"
+    else
+        warning "Bitwarden user does not have proper Docker access"
         
-        # Force group update for current session
-        sudo -u bitwarden newgrp docker || true
+        # Try multiple approaches to fix Docker access
+        log "Attempting to fix Docker permissions..."
+        
+        # Double-check docker group exists and bitwarden user is in it
+        if ! getent group docker > /dev/null; then
+            log "Docker group doesn't exist, creating it..."
+            sudo groupadd docker
+        fi
+        
+        sudo usermod -aG docker bitwarden
+        
+        # Set socket permissions explicitly (again)
+        if [ -e /var/run/docker.sock ]; then
+            sudo chmod 666 /var/run/docker.sock
+        fi
+        
+        # Update group membership without requiring logout
+        if command -v newgrp &> /dev/null; then
+            log "Updating group membership with newgrp..."
+            sudo -u bitwarden bash -c "newgrp docker" || true
+        fi
+        
+        # Final verification
+        if sudo -u bitwarden docker info &>/dev/null; then
+            log "Docker access fixed successfully"
+        else
+            warning "Could not ensure Docker access for bitwarden user"
+            warning "Installation may face permission issues"
+        fi
     fi
     
     log "Bitwarden user and directories configured"
@@ -231,6 +288,57 @@ install_bitwarden() {
     if ! command -v expect &> /dev/null; then
         log "Installing expect package..."
         sudo apt install -y expect
+    fi
+    
+    # Verify Docker and Docker Compose are available to bitwarden user
+    log "Verifying Docker and Docker Compose availability for bitwarden user..."
+    
+    # Check Docker access
+    if ! sudo -u bitwarden docker ps &>/dev/null; then
+        error "Docker is not accessible to the bitwarden user!"
+        error "This must be fixed before proceeding with installation."
+        
+        # Fix Docker socket permissions
+        log "Fixing Docker socket permissions..."
+        if [ -e /var/run/docker.sock ]; then
+            sudo chmod 666 /var/run/docker.sock
+            sudo chgrp docker /var/run/docker.sock 2>/dev/null || true
+        fi
+        
+        # Check again after fixing
+        if ! sudo -u bitwarden docker ps &>/dev/null; then
+            error "Still cannot access Docker. Installation cannot proceed."
+            error "You may need to restart the system or Docker service."
+            exit 1
+        fi
+    fi
+    
+    # Find Docker Compose path for bitwarden user
+    DOCKER_COMPOSE_PATH=""
+    if sudo -u bitwarden command -v docker-compose &>/dev/null; then
+        DOCKER_COMPOSE_PATH=$(sudo -u bitwarden which docker-compose)
+        log "Bitwarden user has access to Docker Compose binary: ${DOCKER_COMPOSE_PATH}"
+    elif sudo -u bitwarden docker compose version &>/dev/null; then
+        log "Bitwarden user has access to Docker Compose plugin"
+    else
+        warning "Docker Compose is not accessible to bitwarden user!"
+        log "Fixing Docker Compose access..."
+        
+        # Ensure Docker Compose binary is executable by all users
+        if [ -f "/usr/local/bin/docker-compose" ]; then
+            sudo chmod +x /usr/local/bin/docker-compose
+            DOCKER_COMPOSE_PATH="/usr/local/bin/docker-compose"
+        elif [ -f "/usr/bin/docker-compose" ]; then
+            sudo chmod +x /usr/bin/docker-compose
+            DOCKER_COMPOSE_PATH="/usr/bin/docker-compose"
+        fi
+        
+        # Set up plugin symlinks if needed
+        if [ -n "$DOCKER_COMPOSE_PATH" ]; then
+            log "Setting up Docker Compose plugin symlinks..."
+            sudo mkdir -p /usr/lib/docker/cli-plugins
+            sudo ln -sf "${DOCKER_COMPOSE_PATH}" /usr/lib/docker/cli-plugins/docker-compose
+        fi
     fi
     
     # Create installation script for bitwarden user
@@ -439,11 +547,29 @@ EOF
     chmod +x /tmp/bitwarden_install.sh
     
     # Export variables for the bitwarden user script
-    export DOMAIN_NAME USE_LETSENCRYPT LETSENCRYPT_EMAIL INSTALL_ID INSTALL_KEY REGION
-      # Switch to bitwarden user and run installation
+    export DOMAIN_NAME USE_LETSENCRYPT LETSENCRYPT_EMAIL INSTALL_ID INSTALL_KEY REGION      # Switch to bitwarden user and run installation
     log "Starting Bitwarden installation - this may take 10-20 minutes..."
     log "The script will show progress updates every minute"
-    sudo -u bitwarden bash /tmp/bitwarden_install.sh
+    
+    # Create necessary directories to avoid permission issues
+    sudo mkdir -p /opt/bitwarden/bwdata/docker
+    sudo chown -R bitwarden:bitwarden /opt/bitwarden
+    
+    # Make sure the current Docker settings are applied
+    if [ -e /var/run/docker.sock ]; then
+        sudo chmod 666 /var/run/docker.sock
+    fi
+    
+    # Run as bitwarden user with explicit environment settings
+    sudo -u bitwarden -E bash /tmp/bitwarden_install.sh
+    
+    # If the installation fails, try running with root Docker permissions as fallback
+    if [ ! -f "/opt/bitwarden/bwdata/docker/docker-compose.yml" ]; then
+        warning "Installation as bitwarden user failed! Trying with root Docker permissions..."
+        sudo -E bash -c "cd /opt/bitwarden && curl -Lso bitwarden.sh https://func.bitwarden.com/api/dl/?app=self-host&platform=linux && chmod 700 bitwarden.sh"
+        sudo -E bash -c "cd /opt/bitwarden && ./bitwarden.sh install"
+        sudo chown -R bitwarden:bitwarden /opt/bitwarden
+    fi
       # Check if installation was successful
     if [ ! -f "/opt/bitwarden/bwdata/docker/docker-compose.yml" ]; then
         error "Installation failed - docker-compose.yml not found"
@@ -745,37 +871,51 @@ check_docker_compose() {
     
     local docker_compose_available=false
     
-    # Check for docker-compose binary
-    if command -v docker-compose &> /dev/null; then
-        log "Docker Compose binary is available"
-        docker_compose_available=true
-    fi
-    
-    # Check for docker compose plugin
+    # Check for docker compose plugin (preferred method)
     if docker compose version &> /dev/null; then
         log "Docker Compose plugin is available"
         docker_compose_available=true
     fi
     
+    # Check for standalone docker-compose binary as fallback
+    if command -v docker-compose &> /dev/null; then
+        log "Docker Compose standalone binary is available"
+        docker_compose_available=true
+    fi
+    
     if [[ "$docker_compose_available" != "true" ]]; then
-        error "Docker Compose is not available! Installing..."
-        # Try to install Docker Compose plugin
-        COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        warning "Docker Compose is not available! Installing from packages..."
         
-        # Create plugin directory
-        sudo mkdir -p /usr/local/lib/docker/cli-plugins
+        # First install docker-compose-plugin (the modern way)
+        log "Installing Docker Compose plugin..."
+        sudo apt update
+        sudo apt install -y docker-compose-plugin
         
-        # Install Docker Compose plugin
-        sudo curl -SL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-        sudo chmod +x /usr/local/bin/docker-compose
-        sudo ln -sf /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
+        # Check if plugin installation worked
+        if ! docker compose version &> /dev/null; then
+            warning "Docker Compose plugin installation failed, trying standalone package..."
+            sudo apt install -y docker-compose
+        fi
         
-        # Check again
+        # Final verification
         if docker compose version &> /dev/null || docker-compose --version &> /dev/null; then
             log "Docker Compose successfully installed"
         else
-            error "Failed to install Docker Compose"
+            error "Failed to install Docker Compose. This is required for Bitwarden installation."
+            error "Please try installing Docker and Docker Compose manually following Docker's official documentation."
             exit 1
+        fi
+    fi
+    
+    # If plugin is not available but standalone is, create plugin symlink
+    if ! docker compose version &> /dev/null && command -v docker-compose &> /dev/null; then
+        log "Setting up Docker Compose plugin symlink from standalone binary..."
+        sudo mkdir -p /usr/lib/docker/cli-plugins
+        sudo ln -sf "$(which docker-compose)" /usr/lib/docker/cli-plugins/docker-compose
+        
+        # Verify plugin functionality
+        if docker compose version &> /dev/null; then
+            log "Docker Compose plugin symlink created successfully"
         fi
     fi
 }
@@ -911,8 +1051,7 @@ main() {
     check_docker_compose  # Add explicit check for Docker Compose
     setup_bitwarden_user
     configure_firewall
-    
-    # Verify Docker is accessible to bitwarden user before proceeding
+      # Verify Docker is accessible to bitwarden user before proceeding
     log "Verifying Docker access for bitwarden user..."
     if ! sudo -u bitwarden docker ps &>/dev/null; then
         warning "The bitwarden user cannot access Docker"
@@ -922,17 +1061,58 @@ main() {
         log "Setting Docker socket permissions..."
         if [ -e /var/run/docker.sock ]; then
             sudo chmod 666 /var/run/docker.sock
+            sudo chgrp docker /var/run/docker.sock 2>/dev/null || true
+            
+            # Restart Docker service to apply permission changes
+            log "Restarting Docker service to apply permission changes..."
+            sudo systemctl restart docker.service || true
+            sleep 5
             
             # Verify again
             if ! sudo -u bitwarden docker ps &>/dev/null; then
-                error "Still cannot access Docker. This might require a system restart."
-                error "You may need to log out and log back in, or restart the system."
-                error "After restarting, run this script again."
-                exit 1
+                error "Still cannot access Docker. Trying one more approach..."
+                
+                # Try adding current user to the Docker group and use sudo to run as bitwarden
+                sudo usermod -aG docker $USER
+                
+                # Create a new shell with updated group membership
+                if ! sudo -g docker -u bitwarden docker ps &>/dev/null; then
+                    error "Docker permission issues persist. This might require a system restart."
+                    error "You may need to log out and log back in, or restart the system."
+                    error "After restarting, run this script again."
+                    exit 1
+                else
+                    log "Found a workaround for Docker access"
+                fi
             fi
         else
             error "Docker socket not found. Is Docker properly installed?"
             exit 1
+        fi
+    fi
+    
+    # Also verify Docker Compose is accessible
+    if ! sudo -u bitwarden docker compose version &>/dev/null && ! sudo -u bitwarden command -v docker-compose &>/dev/null; then
+        warning "Docker Compose not accessible to bitwarden user."
+        log "Setting up Docker Compose access..."
+        
+        # Find Docker Compose binary location
+        DOCKER_COMPOSE_PATH=""
+        if command -v docker-compose &>/dev/null; then
+            DOCKER_COMPOSE_PATH=$(which docker-compose)
+        elif [ -f "/usr/local/bin/docker-compose" ]; then
+            DOCKER_COMPOSE_PATH="/usr/local/bin/docker-compose"
+        elif [ -f "/usr/bin/docker-compose" ]; then
+            DOCKER_COMPOSE_PATH="/usr/bin/docker-compose"
+        fi
+        
+        if [ -n "$DOCKER_COMPOSE_PATH" ]; then
+            log "Setting up Docker Compose symlinks and permissions..."
+            sudo chmod 755 "$DOCKER_COMPOSE_PATH"
+            sudo mkdir -p /usr/lib/docker/cli-plugins
+            sudo ln -sf "$DOCKER_COMPOSE_PATH" /usr/lib/docker/cli-plugins/docker-compose
+        else
+            warning "Could not locate Docker Compose binary. Plugin access may not work."
         fi
     fi
     
