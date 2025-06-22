@@ -347,6 +347,9 @@ verify_installation() {
 
 # Check installation status and provide recovery options
 check_installation_status() {
+    # Temporarily disable exit on error
+    set +e
+    
     log "Checking current installation status..."
     
     # Check if bitwarden user exists
@@ -385,11 +388,13 @@ check_installation_status() {
         else
             warning "⚠ Bitwarden installation script not found"
             return 3
-        fi
-    else
+        fi    else
         info "✗ Bitwarden directory not found"
         return 4
     fi
+    
+    # Re-enable exit on error
+    set -e
 }
 
 # Recovery function for partial installations
