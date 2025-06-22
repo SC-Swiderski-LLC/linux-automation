@@ -479,6 +479,8 @@ main() {
                 exit 1
             fi
         fi
+    elif [[ $status -eq 4 ]]; then
+        info "No existing Bitwarden installation found. Proceeding with fresh install."
     fi
     
     # Proceed with fresh installation
