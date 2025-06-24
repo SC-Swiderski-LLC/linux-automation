@@ -124,6 +124,9 @@ install_docker() {
     # Add current user to docker group
     sudo usermod -aG docker $USER
     
+    # Activate the new group membership immediately
+    log "Activating Docker group membership..."
+    
     success "Docker installed successfully"
 }
 
@@ -142,8 +145,8 @@ setup_wikijs_containers() {
     
     # Create internal docker network
     log "Creating Docker network..."
-    if ! docker network ls | grep -q wikinet; then
-        docker network create wikinet
+    if ! docker_cmd network ls | grep -q wikinet; then
+        docker_cmd network create wikinet
         success "Docker network 'wikinet' created"
     else
         warning "Docker network 'wikinet' already exists"
@@ -151,8 +154,8 @@ setup_wikijs_containers() {
     
     # Create data volume for PostgreSQL
     log "Creating PostgreSQL data volume..."
-    if ! docker volume ls | grep -q pgdata; then
-        docker volume create pgdata
+    if ! docker_cmd volume ls | grep -q pgdata; then
+        docker_cmd volume create pgdata
         success "PostgreSQL data volume created"
     else
         warning "PostgreSQL data volume already exists"
@@ -160,16 +163,16 @@ setup_wikijs_containers() {
     
     # Remove existing containers if they exist
     for container in db wiki wiki-update-companion; do
-        if docker ps -a --format 'table {{.Names}}' | grep -q "^$container$"; then
+        if docker_cmd ps -a --format 'table {{.Names}}' | grep -q "^$container$"; then
             log "Removing existing container: $container"
-            docker stop $container 2>/dev/null || true
-            docker rm $container 2>/dev/null || true
+            docker_cmd stop $container 2>/dev/null || true
+            docker_cmd rm $container 2>/dev/null || true
         fi
     done
     
     # Create PostgreSQL container
     log "Creating PostgreSQL container..."
-    docker create \
+    docker_cmd create \
         --name=db \
         -e POSTGRES_DB=wiki \
         -e POSTGRES_USER=wiki \
@@ -183,7 +186,7 @@ setup_wikijs_containers() {
     
     # Create Wiki.js container
     log "Creating Wiki.js container..."
-    docker create \
+    docker_cmd create \
         --name=wiki \
         -e DB_TYPE=postgres \
         -e DB_HOST=db \
@@ -202,7 +205,7 @@ setup_wikijs_containers() {
     
     # Create Wiki.js Update Companion container
     log "Creating Wiki.js Update Companion container..."
-    docker create \
+    docker_cmd create \
         --name=wiki-update-companion \
         -v /var/run/docker.sock:/var/run/docker.sock:ro \
         --restart=unless-stopped \
@@ -239,16 +242,16 @@ start_containers() {
     
     # Start database first
     log "Starting PostgreSQL container..."
-    docker start db
+    docker_cmd start db
     sleep 5  # Give DB time to initialize
     
     # Start Wiki.js
     log "Starting Wiki.js container..."
-    docker start wiki
+    docker_cmd start wiki
     
     # Start update companion
     log "Starting Wiki.js Update Companion..."
-    docker start wiki-update-companion
+    docker_cmd start wiki-update-companion
     
     success "All containers started successfully"
 }
@@ -285,7 +288,7 @@ display_final_info() {
     echo "=============================================="
     echo
     echo -e "${BLUE}Installation Details:${NC}"
-    echo "• Docker: $(docker --version | cut -d' ' -f3 | tr -d ',')"
+    echo "• Docker: $(docker_cmd --version | cut -d' ' -f3 | tr -d ',')"
     echo "• PostgreSQL 17: Running in container"
     echo "• Wiki.js 2.x: Running in container"
     echo "• Update Companion: Running in container"
@@ -297,7 +300,7 @@ display_final_info() {
     echo "• Database Secret: $DB_SECRET_FILE"
     echo
     echo -e "${BLUE}Container Status:${NC}"
-    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" --filter "name=db" --filter "name=wiki" --filter "name=wiki-update-companion"
+    docker_cmd ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" --filter "name=db" --filter "name=wiki" --filter "name=wiki-update-companion"
     echo
     echo -e "${BLUE}Next Steps:${NC}"
     echo "1. Open your web browser and navigate to: http://$SERVER_IP/"
@@ -320,6 +323,29 @@ display_final_info() {
     echo "=============================================="
 }
 
+# Function to check Docker permissions
+check_docker_permissions() {
+    log "Checking Docker permissions..."
+    
+    # Try to run a simple Docker command
+    if docker info >/dev/null 2>&1; then
+        success "Docker permissions are working correctly"
+        return 0
+    else
+        warning "Docker permissions not available. Will use sudo for Docker commands."
+        return 1
+    fi
+}
+
+# Function to run docker commands with proper permissions
+docker_cmd() {
+    if docker info >/dev/null 2>&1; then
+        docker "$@"
+    else
+        sudo docker "$@"
+    fi
+}
+
 # Main execution
 main() {
     log "Wiki.js Installation Script Started"
@@ -327,18 +353,17 @@ main() {
     check_ubuntu_version
     update_system
     install_docker
+    check_docker_permissions
     setup_wikijs_containers
     setup_firewall
     start_containers
     wait_for_services
     display_final_info
     
-    # Note about Docker group membership
-    if groups $USER | grep -q docker; then
-        log "User is already in docker group"
-    else
-        warning "You may need to log out and back in for Docker group membership to take effect"
-        warning "Or run: newgrp docker"
+    # Inform user about Docker group membership
+    if ! docker info >/dev/null 2>&1; then
+        warning "Note: You may need to log out and back in for Docker group membership to take full effect"
+        warning "For now, Docker commands in this script used sudo when necessary"
     fi
 }
 
